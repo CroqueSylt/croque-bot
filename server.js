@@ -23,7 +23,7 @@ function buildTwiml(callSid) {
   connect.stream({
     // WICHTIG: WSS und korrekte Domain
     url: "wss://croque-bot.onrender.com/media",
-    track: "inbound",
+    track: "inbound_track",
     // Absolute URL für Status-Events
     statusCallback: "https://croque-bot.onrender.com/ms-status",
     statusCallbackMethod: "POST",
