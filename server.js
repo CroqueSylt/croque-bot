@@ -18,7 +18,7 @@ function buildTwiml(callSid) {
 
   const connect = twiml.connect();
   connect.stream({
-    url: "wss://DEIN-RENDER-SERVICE.onrender.com/media", // später deine Render-URL einsetzen
+    url: "wss://croque-bot.onrender.com/media",
     track: "inbound",
     statusCallback: "/ms-status",
     statusCallbackMethod: "POST",
