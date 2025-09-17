@@ -1,5 +1,5 @@
 // server.js
-// Minimaler Twilio-Webhook + Media Streams (WS) mit ausführlichem Logging
+// Twilio Voice Webhook + Media Streams (WebSocket) – fertig verdrahtet
 
 const express = require("express");
 const twilio = require("twilio");
@@ -8,25 +8,24 @@ const WebSocket = require("ws");
 
 const app = express();
 
-// --- Middleware (Twilio schickt Form-POSTs) ---
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+// --- Middleware ---
+app.use(express.urlencoded({ extended: false })); // Twilio POST form-encoded
+app.use(express.json()); // für statusCallback JSON etc.
 
-// --- TwiML bauen: kurze Ansage + MediaStream verbinden ---
+// --- TwiML erzeugen: kurze Ansage und Stream verbinden ---
 function buildTwiml(callSid) {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  // Kurze Ansage, dann Stream öffnen
   twiml.say(
     { voice: "Polly.Marlene", language: "de-DE" },
-    "Einen Moment, ich verbinde Sie."
+    "Einen Moment, ich verbinde Sie. Verdamt nochmal. Können Sie nicht woanders bestellen?"
   );
 
   const connect = twiml.connect();
   connect.stream({
-    // >>> Falls deine Render-URL anders ist, hier anpassen:
+    // >>> Falls deine Render-URL abweicht, HIER anpassen:
     url: "wss://croque-bot.onrender.com/media",
-    track: "inbound", // wir hören den Anrufer
+    track: "inbound",
     statusCallback: "/ms-status",
     statusCallbackMethod: "POST",
   });
@@ -39,12 +38,12 @@ app.get("/", (_req, res) => {
   res.send("OK - Croque Bot läuft (mit Media Streams)");
 });
 
-// --- Test im Browser: zeigt TwiML ---
+// --- Test im Browser: TwiML ansehen (GET) ---
 app.get("/incoming-call", (_req, res) => {
   res.type("text/xml").send(buildTwiml("TEST-BROWSER"));
 });
 
-// --- Twilio-Webhook (POST): Haupteinstieg bei Anruf ---
+// --- Twilio-Webhook (POST) ---
 app.post("/incoming-call", (req, res) => {
   const callSid = req.body?.CallSid;
   console.log("Incoming call:", callSid);
@@ -53,14 +52,19 @@ app.post("/incoming-call", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// --- Status-Callback von <Stream> (optional, sehr hilfreich) ---
+// --- Status-Callback vom <Stream> (optional aber super hilfreich) ---
 app.post("/ms-status", (req, res) => {
-  console.log("MediaStreams Status:", req.body);
+  console.log("MS Status:", req.body);
   res.sendStatus(204);
 });
 
-// --- HTTP-Server erstellen, damit WS & HTTP denselben Port teilen ---
+// --- HTTP-Server erstellen (damit WS + HTTP denselben Port nutzen) ---
 const server = http.createServer(app);
+
+// --- Upgrade-Logging: zeigt eingehende WS-Upgrades (z. B. /media) ---
+server.on("upgrade", (req, _socket, _head) => {
+  console.log("HTTP upgrade requested:", req.url);
+});
 
 // --- WebSocket-Server für Twilio Media Streams ---
 const wss = new WebSocket.Server({ server, path: "/media" });
@@ -89,14 +93,13 @@ wss.on("connection", (ws, req) => {
         break;
 
       case "media":
-        // Alle 20ms kommt ein Base64-Audiochunk
         mediaCount++;
         if (mediaCount % 50 === 0) {
           console.log(`media packets: ${mediaCount}`);
         }
-        // Beispiel: Zugriff auf den Audio-Chunk
+        // Zugriff auf Audiodaten (Base64):
         // const chunkB64 = data.media?.payload;
-        // -> später an STT weiterreichen
+        // -> Hier später an STT (Speech-to-Text) streamen
         break;
 
       case "stop":
@@ -109,7 +112,7 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", (code, reason) =>
-    console.log("Media Stream getrennt", code, reason.toString())
+    console.log("Media Stream getrennt", code, reason?.toString?.())
   );
   ws.on("error", (err) => console.error("WS error:", err));
 });
