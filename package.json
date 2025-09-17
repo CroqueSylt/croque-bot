@@ -4,6 +4,7 @@
   "main": "server.js",
   "dependencies": {
     "express": "^4.18.2",
-    "twilio": "^4.22.0"
+    "twilio": "^4.22.0",
+    "ws": "^8.18.3"
   }
 }
