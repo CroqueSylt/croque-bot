@@ -164,16 +164,19 @@ wss.on("connection", (ws, req) => {
 // WAV-Datei aus PCM16 LE @ 8kHz erzeugen
 function writeWav(filepath, pcmBuffer, sampleRate) {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filepath);
-    const writer = new FileWriter(file, {
-      channels: 1,
-      sampleRate,
-      bitDepth: 16,
-    });
-    writer.on("finish", resolve);
-    writer.on("error", reject);
-    writer.write(pcmBuffer);
-    writer.end();
+    try {
+      const writer = new FileWriter(filepath, {
+        channels: 1,
+        sampleRate,
+        bitDepth: 16,
+      });
+      writer.on("finish", resolve);
+      writer.on("error", reject);
+      writer.write(pcmBuffer);
+      writer.end();
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
