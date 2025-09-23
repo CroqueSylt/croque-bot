@@ -1,3 +1,21 @@
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+async function sayToCaller(callSid, text) {
+  // Spricht etwas und startet danach den Stream neu (damit wir weiter zuhören)
+  const replyTwiml =
+    `<?xml version="1.0" encoding="UTF-8"?>
+     <Response>
+       <Say voice="Polly.Marlene" language="de-DE">${text}</Say>
+       <Pause length="0.5"/>
+       <Connect>
+         <Stream url="wss://croque-bot.onrender.com/media" track="inbound_track"
+                 statusCallback="https://croque-bot.onrender.com/ms-status" statusCallbackMethod="POST"/>
+       </Connect>
+     </Response>`;
+
+  await twilioClient.calls(callSid).update({ twiml: replyTwiml });
+}
+
 // server.js
 // Twilio Voice Webhook + Media Streams (WebSocket) + WAV + Whisper
 
@@ -134,26 +152,28 @@ wss.on("connection", (ws, req) => {
         if (mediaCount % 50 === 0) console.log(`media packets: ${mediaCount}`);
         break;
 
-      case "stop":
-        console.log("Stream stop. Total media packets:", mediaCount);
-        try {
-          if (pcmChunks.length) {
-            const wavPath = path.join("/tmp", `call_${Date.now()}.wav`);
-            await writeWav(wavPath, Buffer.concat(pcmChunks), SAMPLE_RATE);
-            console.log("WAV geschrieben:", wavPath);
-            await transcribeWithOpenAI(wavPath);
-          } else {
-            console.log("Keine PCM-Daten gesammelt – nichts zu transkribieren.");
-          }
-        } catch (e) {
-          console.error("Fehler beim Schreiben/Transkribieren:", e);
-        }
-        break;
+case "stop":
+  console.log("Stream stop. Total media packets:", mediaCount);
+  try {
+    if (pcmChunks.length) {
+      const wavPath = path.join("/tmp", `call_${Date.now()}.wav`);
+      await writeWav(wavPath, Buffer.concat(pcmChunks), SAMPLE_RATE);
+      console.log("WAV geschrieben:", wavPath);
+      const text = await transcribeWithOpenAI(wavPath); // gib Text zurück (siehe unten)
+      console.log("Transkript:", text);
 
-      default:
-        console.log("WS event:", data.event);
+      // *** einfache Demo-Antwort:
+      if (currentCallSid) {
+        await sayToCaller(currentCallSid, `Ich habe verstanden: ${text}. Was möchten Sie genau bestellen?`);
+      }
+    } else {
+      console.log("Keine PCM-Daten gesammelt – nichts zu transkribieren.");
     }
-  });
+  } catch (e) {
+    console.error("Fehler beim Schreiben/Transkribieren:", e);
+  }
+  break;
+
 
   ws.on("close", (code, reason) =>
     console.log("Media Stream getrennt", code, reason?.toString?.())
@@ -184,7 +204,7 @@ function writeWav(filepath, pcmBuffer, sampleRate) {
 async function transcribeWithOpenAI(wavPath) {
   if (!process.env.OPENAI_API_KEY) {
     console.warn("Kein OPENAI_API_KEY gesetzt – überspringe Transkription.");
-    return;
+    return "";
   }
   try {
     console.log("Sende an OpenAI Whisper…");
@@ -195,11 +215,13 @@ async function transcribeWithOpenAI(wavPath) {
       response_format: "verbose_json",
       temperature: 0,
     });
-    console.log("Transkript:", resp.text || resp?.results || resp);
+    return resp.text || "";
   } catch (err) {
     console.error("OpenAI Whisper Fehler:", err?.response?.data || err);
+    return "";
   }
 }
+
 
 // Start
 const PORT = process.env.PORT || 3000; // Render setzt PORT automatisch
