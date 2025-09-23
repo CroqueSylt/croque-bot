@@ -171,7 +171,10 @@ async function transcribeWithOpenAI(wavPath) {
   }
 }
 
-// ---- WS-Handling ----
+// --- Turn-Taking mit einfacher Sprechpausenerkennung (VAD-light) ---
+const SILENCE_MS = 1200;           // Pause-Länge, die ein „Turn-Ende“ signalisiert
+const MIN_AUDIO_MS = 1200;         // Mindestens ~1,2s Audio sammeln, bevor wir transkribieren
+
 wss.on("connection", (ws, req) => {
   console.log("WS connection attempt:", req.url, "headers:", req.headers);
   console.log("Media Stream verbunden");
@@ -179,6 +182,68 @@ wss.on("connection", (ws, req) => {
   let pcmChunks = [];
   let mediaCount = 0;
   let currentCallSid = null;
+
+  // Timing für VAD-light:
+  let firstPacketAt = 0;
+  let lastPacketAt = 0;
+  let silenceTimer = null;
+  let processing = false;   // schützt vor paralleler Transkription
+  let closed = false;       // WS geschlossen?
+
+  function clearSilenceTimer() {
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+    }
+  }
+
+  function scheduleSilenceTimer() {
+    clearSilenceTimer();
+    silenceTimer = setTimeout(onSilenceTimeout, SILENCE_MS);
+  }
+
+  async function onSilenceTimeout() {
+    // Nur auslösen, wenn wir genug Audio haben und nicht bereits transkribieren
+    if (processing || closed) return;
+    const durationMs = lastPacketAt && firstPacketAt ? (lastPacketAt - firstPacketAt) : 0;
+    if (durationMs < MIN_AUDIO_MS || pcmChunks.length === 0) {
+      // Zu kurz – weiter zuhören
+      return;
+    }
+
+    processing = true;
+    try {
+      const wavPath = path.join("/tmp", `turn_${Date.now()}.wav`);
+      await writeWav(wavPath, Buffer.concat(pcmChunks), SAMPLE_RATE);
+      console.log("TURN WAV geschrieben:", wavPath, `(${Math.round(durationMs)}ms)`);
+
+      const transcript = await transcribeWithOpenAI(wavPath);
+      console.log("TURN Transkript:", transcript);
+
+      // Antwort nur versuchen, wenn wir eine CallSid haben
+      if (currentCallSid && transcript) {
+        const reply = `Ich habe verstanden: ${transcript}. Was möchten Sie genau bestellen?`;
+        try {
+          await sayToCaller(currentCallSid, reply);
+        } catch (err) {
+          // Wenn der Call schon beendet ist (21220), nicht schlimm – nur loggen
+          if (err?.code === 21220) {
+            console.warn("Call nicht mehr aktiv (21220) – Antwort übersprungen.");
+          } else {
+            console.error("Fehler bei sayToCaller:", err);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Fehler im Turn-Handling:", e);
+    } finally {
+      // Buffer für nächsten Turn zurücksetzen & weiter zuhören
+      pcmChunks = [];
+      firstPacketAt = 0;
+      lastPacketAt = 0;
+      processing = false;
+    }
+  }
 
   ws.on("message", async (msg) => {
     let data;
@@ -197,6 +262,7 @@ wss.on("connection", (ws, req) => {
       case "start":
         currentCallSid = data.start?.callSid || "unknown";
         console.log("Stream start:", currentCallSid, data.start?.streamSid);
+        // Ab hier hört der Bot zu
         break;
 
       case "media":
@@ -204,33 +270,24 @@ wss.on("connection", (ws, req) => {
         const mu = Buffer.from(data.media?.payload || "", "base64");
         const pcm = decodeMuLawBuffer(mu);
         pcmChunks.push(pcm);
+
+        const now = Date.now();
+        if (!firstPacketAt) firstPacketAt = now;
+        lastPacketAt = now;
+
+        // Jede Media-Nachricht verlängert die „Sprechphase“ → Timer neu setzen
+        scheduleSilenceTimer();
+
         if (mediaCount % 50 === 0) console.log(`media packets: ${mediaCount}`);
         break;
 
       case "stop":
         console.log("Stream stop. Total media packets:", mediaCount);
-        try {
-          let transcript = "";
-          if (pcmChunks.length) {
-            const wavPath = path.join("/tmp", `call_${Date.now()}.wav`);
-            await writeWav(wavPath, Buffer.concat(pcmChunks), SAMPLE_RATE);
-            console.log("WAV geschrieben:", wavPath);
-            transcript = await transcribeWithOpenAI(wavPath);
-            console.log("Transkript:", transcript);
-          } else {
-            console.log("Keine PCM-Daten gesammelt – nichts zu transkribieren.");
-          }
+        clearSilenceTimer();
 
-          // Demo-Antwort: gelesenen Text zurückspiegeln & Stream fortsetzen
-          if (currentCallSid) {
-            const reply =
-              transcript
-                ? `Ich habe verstanden: ${transcript}. Was möchten Sie genau bestellen?`
-                : `Ich habe nichts verstanden. Können Sie Ihre Bestellung bitte wiederholen?`;
-            await sayToCaller(currentCallSid, reply);
-          }
-        } catch (e) {
-          console.error("Fehler beim Schreiben/Transkribieren/Antworten:", e);
+        // Optional: Wenn noch Audio im Buffer liegt, versuche letzte Runde zu verarbeiten
+        if (!processing && pcmChunks.length > 0) {
+          await onSilenceTimeout(); // kann fail-safen – falls Call schon beendet ist, fangen wir es ab
         }
         break;
 
@@ -239,11 +296,19 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", (code, reason) =>
-    console.log("Media Stream getrennt", code, reason?.toString?.())
-  );
-  ws.on("error", (err) => console.error("WS error:", err));
+  ws.on("close", (code, reason) => {
+    closed = true;
+    clearSilenceTimer();
+    console.log("Media Stream getrennt", code, reason?.toString?.());
+  });
+
+  ws.on("error", (err) => {
+    closed = true;
+    clearSilenceTimer();
+    console.error("WS error:", err);
+  });
 });
+
 
 // ---- Start ----
 const PORT = process.env.PORT || 3000; // Render setzt PORT automatisch
