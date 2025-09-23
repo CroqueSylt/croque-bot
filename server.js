@@ -1,5 +1,5 @@
 // server.js
-// Twilio Voice Webhook + Media Streams + WAV + OpenAI Whisper + Turn-Taking
+// Twilio Voice Webhook + Media Streams + WAV + OpenAI Whisper + stabiles Turn-Taking
 
 const express = require("express");
 const twilio = require("twilio");
@@ -15,7 +15,6 @@ const app = express();
 // ---------- ENV & Clients ----------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Twilio-Client lazy initialisieren (App crasht nicht, wenn ENV fehlt)
 let twilioClient = null;
 function getTwilioClient() {
   if (twilioClient) return twilioClient;
@@ -29,44 +28,33 @@ function getTwilioClient() {
   return twilioClient;
 }
 
-// ---------- Middleware ----------
-app.use(express.urlencoded({ extended: false })); // Twilio form POSTs
-app.use(express.json());                          // für Status-Callbacks / JSON
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 // Begrüßung per Env steuerbar
-const GREETING =
-  process.env.GREETING ||
-  "Willkommen bei Croque Sylt. Einen Moment, ich verbinde Sie.";
+const GREETING = process.env.GREETING || "Willkommen bei Croque Sylt. Einen Moment, ich verbinde Sie.";
 
-// ---------- TwiML erzeugen: kurze Ansage + 1s Pause + MediaStream ----------
+// ---------- TwiML ----------
 function buildTwiml() {
-  const twiml = new twilio.twiml.VoiceResponse();
+  const vr = new twilio.twiml.VoiceResponse();
+  vr.say({ voice: "Polly.Marlene", language: "de-DE" }, GREETING);
+  vr.pause({ length: 1 });
 
-  twiml.say({ voice: "Polly.Marlene", language: "de-DE" }, GREETING);
-  twiml.pause({ length: 1 }); // Hobby/Free-Pläne brauchen manchmal 1s zum Aufwachen
-
-  const connect = twiml.connect();
-  connect.stream({
-    // >>> HIER ggf. deine Render-URL einsetzen <<<
+  const c = vr.connect();
+  c.stream({
+    // >>> ggf. Render-URL anpassen:
     url: "wss://croque-bot.onrender.com/media",
     track: "inbound_track",
-    // absolute URL!
     statusCallback: "https://croque-bot.onrender.com/ms-status",
     statusCallbackMethod: "POST",
   });
 
-  return twiml.toString();
+  return vr.toString();
 }
 
-// ---------- Healthcheck ----------
+// ---------- HTTP ----------
 app.get("/", (_req, res) => res.send("OK - Croque Bot läuft (Media Streams)"));
-
-// TwiML Sichttest (GET)
-app.get("/incoming-call", (_req, res) => {
-  res.type("text/xml").send(buildTwiml());
-});
-
-// Twilio-Haupthook (POST)
+app.get("/incoming-call", (_req, res) => res.type("text/xml").send(buildTwiml()));
 app.post("/incoming-call", (req, res) => {
   const callSid = req.body?.CallSid;
   console.log("Incoming call:", callSid);
@@ -74,25 +62,18 @@ app.post("/incoming-call", (req, res) => {
   console.log("TwiML sent:\n", twiml);
   res.type("text/xml").send(twiml);
 });
-
-// Status-Callback vom <Stream>
 app.post("/ms-status", (req, res) => {
   console.log("MS Status:", req.body);
   res.sendStatus(204);
 });
 
-// ---------- HTTP-Server (gemeinsam für HTTP + WS) ----------
 const server = http.createServer(app);
+server.on("upgrade", (req) => console.log("HTTP upgrade requested:", req.url));
 
-// Upgrade-Logging (zeigt WS-Handshakes)
-server.on("upgrade", (req, _socket, _head) => {
-  console.log("HTTP upgrade requested:", req.url);
-});
-
-// ---------- WebSocket-Server unter /media ----------
+// ---------- WebSocket ----------
 const wss = new WebSocket.Server({ server, path: "/media" });
 
-// µ-law → PCM16 (G.711)
+// µ-law → PCM16
 function muLawToPcm16(uVal) {
   uVal = ~uVal & 0xff;
   const sign = (uVal & 0x80) ? -1 : 1;
@@ -106,74 +87,65 @@ function muLawToPcm16(uVal) {
   return sample;
 }
 function decodeMuLawBuffer(buf) {
-  const out = Buffer.alloc(buf.length * 2); // 16-bit LE
-  for (let i = 0; i < buf.length; i++) {
-    const s = muLawToPcm16(buf[i]);
-    out.writeInt16LE(s, i * 2);
-  }
+  const out = Buffer.alloc(buf.length * 2);
+  for (let i = 0; i < buf.length; i++) out.writeInt16LE(muLawToPcm16(buf[i]), i * 2);
   return out;
 }
+const SAMPLE_RATE = 8000;
 
-const SAMPLE_RATE = 8000; // Twilio Media Streams = 8kHz µ-law
-
-// XML-Escapes (für <Say>)
+// XML-Escape
 function escapeXml(s = "") {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Während des Calls etwas sagen + Stream wieder starten
+// Sprechdauer grob schätzen (für Cooldown)
+function estimateSayMs(text) {
+  const chars = (text || "").length;
+  const cps = 12; // Zeichen pro Sekunde grob
+  const speakMs = Math.max(800, Math.round((chars / cps) * 1000));
+  return speakMs + 400; // kleine Pause
+}
+
+// Sprechen + Stream neu starten
 async function sayToCaller(callSid, text) {
   const client = getTwilioClient();
-  if (!client) {
-    console.warn("Kein Twilio-Client -> überspringe sayToCaller()");
-    return;
-  }
+  if (!client) { console.warn("Kein Twilio-Client -> sayToCaller übersprungen"); return false; }
+
   const replyTwiml =
-    `<?xml version="1.0" encoding="UTF-8"?>
-     <Response>
-       <Say voice="Polly.Marlene" language="de-DE">${escapeXml(text)}</Say>
-       <Pause length="0.5"/>
-       <Connect>
-         <!-- >>> HIER ggf. deine Render-URL einsetzen <<< -->
-         <Stream url="wss://croque-bot.onrender.com/media" track="inbound_track"
-                 statusCallback="https://croque-bot.onrender.com/ms-status"
-                 statusCallbackMethod="POST"/>
-       </Connect>
-     </Response>`;
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Marlene" language="de-DE">${escapeXml(text)}</Say>
+  <Pause length="0.5"/>
+  <Connect>
+    <!-- >>> ggf. Render-URL anpassen: -->
+    <Stream url="wss://croque-bot.onrender.com/media" track="inbound_track"
+            statusCallback="https://croque-bot.onrender.com/ms-status"
+            statusCallbackMethod="POST"/>
+  </Connect>
+</Response>`;
 
   console.log(`[sayToCaller] update call ${callSid} with:`, text);
   await client.calls(callSid).update({ twiml: replyTwiml });
   console.log("[sayToCaller] OK (calls.update)");
+  return true;
 }
 
-// WAV-Datei aus PCM16 LE @ 8kHz erzeugen
+// WAV schreiben
 function writeWav(filepath, pcmBuffer, sampleRate) {
   return new Promise((resolve, reject) => {
     try {
-      const writer = new FileWriter(filepath, {
-        channels: 1,
-        sampleRate,
-        bitDepth: 16,
-      });
+      const writer = new FileWriter(filepath, { channels: 1, sampleRate, bitDepth: 16 });
       writer.on("finish", resolve);
       writer.on("error", reject);
       writer.write(pcmBuffer);
       writer.end();
-    } catch (err) {
-      reject(err);
-    }
+    } catch (err) { reject(err); }
   });
 }
 
-// OpenAI Whisper – Transkription einer WAV
+// Whisper
 async function transcribeWithOpenAI(wavPath) {
-  if (!process.env.OPENAI_API_KEY) {
-    console.warn("Kein OPENAI_API_KEY gesetzt – überspringe Transkription.");
-    return "";
-  }
+  if (!process.env.OPENAI_API_KEY) { console.warn("Kein OPENAI_API_KEY – skip STT"); return ""; }
   try {
     console.log("Sende an OpenAI Whisper…");
     const resp = await openai.audio.transcriptions.create({
@@ -190,94 +162,78 @@ async function transcribeWithOpenAI(wavPath) {
   }
 }
 
-// ---------- Turn-Taking: Sprechpause + erzwungener Turn ----------
-const SILENCE_MS     = 500;   // 0,5 s Pause reicht als Turn-Ende
-const MIN_AUDIO_MS   = 600;   // min. 0,6 s Audio sammeln
-const MAX_LISTEN_MS  = 3500;  // spätestens nach 3,5 s Turn erzwingen
-const INITIAL_ACK_MS = 1500;  // 1,5 s nach erstem Audio: „Einen Moment …“
+// ---------- Ruhiges Turn-Taking ----------
+// Schwellen großzügiger, damit nicht dauernd unterbrochen wird:
+const SILENCE_MS     = 1200;  // 1,2 s Pause = Turn-Ende
+const MIN_AUDIO_MS   = 1500;  // min. 1,5 s zusammenhängendes Audio
+const MAX_LISTEN_MS  = 8000;  // spätestens nach 8 s erzwungener Turn
+const INITIAL_ACK_ON_FIRST_TURN = true; // nur im ersten Turn des Calls
+const SPEAK_COOLDOWN_PAD_MS = 700;      // kleine Zusatzpause nach <Say>
 
 wss.on("connection", (ws, req) => {
   console.log("WS connection attempt:", req.url, "headers:", req.headers);
   console.log("Media Stream verbunden");
 
+  // Pro-Call-Zustand
+  let callSid = null;
+  let turnIndex = 0;               // 0 = erster Turn
+  let hasInitialAcked = false;     // initiale Bestätigung nur einmal pro Call
+
+  // Pro-Stream/Turn-Zustand
   let pcmChunks = [];
   let mediaCount = 0;
-  let currentCallSid = null;
-
-  // Timing / Steuerung
   let firstPacketAt = 0;
   let lastPacketAt = 0;
   let silenceTimer = null;
   let maxListenTimer = null;
-  let initialAckTimer = null;
   let processing = false;
   let closed = false;
 
-  // Timer-Helpers
+  // Cooldown nach unserer Ansage (wir ignorieren Kundenaudio, damit wir ihn nicht „bargen“)
+  let speakCooldownUntil = 0;
+
   function clearTimer(t) { if (t) clearTimeout(t); }
-  function clearAllTimers() {
-    clearTimer(silenceTimer);     silenceTimer = null;
-    clearTimer(maxListenTimer);   maxListenTimer = null;
-    clearTimer(initialAckTimer);  initialAckTimer = null;
-  }
-  function resetSilenceTimer() {
-    clearTimer(silenceTimer);
-    silenceTimer = setTimeout(onSilenceTimeout, SILENCE_MS);
-  }
-  function armMaxListenTimer() {
-    clearTimer(maxListenTimer);
-    maxListenTimer = setTimeout(onForcedTurn, MAX_LISTEN_MS);
-  }
-  function armInitialAckTimer() {
-    clearTimer(initialAckTimer);
-    initialAckTimer = setTimeout(onInitialAck, INITIAL_ACK_MS);
-  }
+  function clearAllTimers() { clearTimer(silenceTimer); clearTimer(maxListenTimer); silenceTimer = maxListenTimer = null; }
+  function resetSilenceTimer() { clearTimer(silenceTimer); silenceTimer = setTimeout(onSilenceTimeout, SILENCE_MS); }
+  function armMaxListenTimer() { clearTimer(maxListenTimer); maxListenTimer = setTimeout(onForcedTurn, MAX_LISTEN_MS); }
 
-  // Früheste Bestätigung (hält Call aktiv)
-  async function onInitialAck() {
-    if (processing || closed) return;
-    if (!currentCallSid) return;
-    console.log("[VAD] initial ACK fired");
-    try {
-      await sayToCaller(currentCallSid, "Einen Moment, ich verarbeite das.");
-    } catch (err) {
-      if (err?.code === 21220) console.warn("Call nicht aktiv (21220) – initiale Bestätigung übersprungen.");
-      else console.error("Fehler initiale Bestätigung:", err);
-    }
-  }
-
-  // Normales Turn-Ende: Pause erkannt
   async function onSilenceTimeout() {
     if (processing || closed) return;
-    const durationMs = (lastPacketAt && firstPacketAt) ? (lastPacketAt - firstPacketAt) : 0;
-    if (durationMs < MIN_AUDIO_MS || pcmChunks.length === 0) return;
+    const dur = (lastPacketAt && firstPacketAt) ? (lastPacketAt - firstPacketAt) : 0;
+    if (dur < MIN_AUDIO_MS || pcmChunks.length === 0) return;
     console.log("[VAD] silence timeout -> processTurn");
     await processTurn("silence");
   }
-
-  // Erzwungenes Turn-Ende (keine Pause innerhalb MAX_LISTEN_MS)
   async function onForcedTurn() {
     if (processing || closed) return;
-    const durationMs = (Date.now() - (firstPacketAt || Date.now()));
-    if (durationMs < MIN_AUDIO_MS || pcmChunks.length === 0) return;
+    const dur = (Date.now() - (firstPacketAt || Date.now()));
+    if (dur < MIN_AUDIO_MS || pcmChunks.length === 0) return;
     console.log("[VAD] forced turn -> processTurn");
     await processTurn("forced");
   }
 
-  // Turn-Verarbeitung: (a) sofort kurze Bestätigung, (b) WAV+STT, (c) inhaltliche Antwort
   async function processTurn(reason) {
     processing = true;
-    console.log(`[VAD] processTurn start (${reason})`);
+    console.log(`[VAD] processTurn start (${reason}) turn=${turnIndex}`);
+
     try {
-      if (currentCallSid) {
+      // 1) Erst im allerersten Turn: kurze Bestätigung (einmal pro Call)
+      if (INITIAL_ACK_ON_FIRST_TURN && !hasInitialAcked && callSid) {
+        const ackText = "Einen Moment, ich verarbeite das.";
         try {
-          await sayToCaller(currentCallSid, "Einen Moment, ich verarbeite das.");
+          const ok = await sayToCaller(callSid, ackText);
+          if (ok) {
+            hasInitialAcked = true;
+            // Schätze Dauer, setze Cooldown
+            speakCooldownUntil = Date.now() + estimateSayMs(ackText) + SPEAK_COOLDOWN_PAD_MS;
+          }
         } catch (err) {
-          if (err?.code === 21220) console.warn("Call nicht aktiv (21220) – Bestätigungsansage übersprungen.");
+          if (err?.code === 21220) console.warn("Call nicht aktiv (21220) – initiale Bestätigung übersprungen.");
           else console.error("Fehler bei Bestätigungsansage:", err);
         }
       }
 
+      // 2) Audio zu WAV & STT
       const wavPath = path.join("/tmp", `turn_${Date.now()}_${reason}.wav`);
       await writeWav(wavPath, Buffer.concat(pcmChunks), SAMPLE_RATE);
       console.log(`TURN (${reason}) WAV:`, wavPath, `(${Math.round((lastPacketAt - firstPacketAt) || 0)}ms)`);
@@ -285,10 +241,17 @@ wss.on("connection", (ws, req) => {
       const transcript = await transcribeWithOpenAI(wavPath);
       console.log("TURN Transkript:", transcript);
 
-      if (currentCallSid && transcript) {
+      // 3) Inhaltliche Antwort
+      if (callSid) {
+        const reply = transcript
+          ? `Ich habe verstanden: ${transcript}. Was möchten Sie genau bestellen?`
+          : `Ich habe Sie nicht gut verstanden. Was möchten Sie bestellen?`;
+
         try {
-          const reply = `Ich habe verstanden: ${transcript}. Was möchten Sie genau bestellen?`;
-          await sayToCaller(currentCallSid, reply);
+          const ok = await sayToCaller(callSid, reply);
+          if (ok) {
+            speakCooldownUntil = Date.now() + estimateSayMs(reply) + SPEAK_COOLDOWN_PAD_MS;
+          }
         } catch (err) {
           if (err?.code === 21220) console.warn("Call nicht aktiv (21220) – inhaltliche Antwort übersprungen.");
           else console.error("Fehler bei inhaltlicher Antwort:", err);
@@ -297,15 +260,14 @@ wss.on("connection", (ws, req) => {
     } catch (e) {
       console.error("Fehler im Turn-Handling:", e);
     } finally {
-      // Reset für nächsten Turn
+      // Reset für nächsten Turn (neuer Stream folgt unmittelbar nach sayToCaller)
       pcmChunks = [];
       firstPacketAt = 0;
       lastPacketAt = 0;
       processing = false;
-
-      // Timer aus – Twilio startet nach calls.update neuen <Stream>
       clearAllTimers();
-      console.log("[VAD] processTurn done");
+      turnIndex += 1;
+      console.log("[VAD] processTurn done; await next stream");
     }
   }
 
@@ -319,34 +281,43 @@ wss.on("connection", (ws, req) => {
         break;
 
       case "start":
-        currentCallSid = data.start?.callSid || "unknown";
-        console.log("Stream start:", currentCallSid, data.start?.streamSid);
+        callSid = data.start?.callSid || callSid || "unknown";
+        console.log("Stream start:", callSid, data.start?.streamSid);
+        // Wenn wir gerade gesprochen haben, ignoriere Kundenaudio bis Cooldown abgelaufen
         break;
 
-      case "media":
+      case "media": {
+        const now = Date.now();
+        if (now < speakCooldownUntil) {
+          // Wir haben gerade gesprochen → dieser Audio-Input wird ignoriert, um Barge-In zu verhindern
+          if (mediaCount % 50 === 0) console.log(`[VAD] ignoring media during speakCooldown (until ${speakCooldownUntil})`);
+          mediaCount++;
+          break;
+        }
+
         mediaCount++;
         const mu = Buffer.from(data.media?.payload || "", "base64");
         const pcm = decodeMuLawBuffer(mu);
         pcmChunks.push(pcm);
 
-        const now = Date.now();
         if (!firstPacketAt) {
           firstPacketAt = now;
-          armInitialAckTimer();  // nach 1,5s erste kurze Bestätigung
-          armMaxListenTimer();   // spätestens nach 3,5s Turn erzwingen
+          armMaxListenTimer();
         }
         lastPacketAt = now;
 
-        // Jede Media-Nachricht = Sprecher aktiv → Stille-Timer neu setzen
+        // Nur wenn wir nicht im Cooldown sind, wird Stille getrackt
         resetSilenceTimer();
 
-        if (mediaCount % 50 === 0) console.log(`media packets: ${mediaCount}`);
+        if (mediaCount % 100 === 0) console.log(`media packets: ${mediaCount}`);
         break;
+      }
 
       case "stop":
         console.log("Stream stop. Total media packets:", mediaCount);
         clearAllTimers();
-        // Letzten Rest evtl. noch verarbeiten
+
+        // Falls noch etwas im Buffer liegt und wir nicht gerade transkribieren: einmal verarbeiten
         if (!processing && pcmChunks.length > 0) {
           await onSilenceTimeout();
         }
@@ -362,7 +333,6 @@ wss.on("connection", (ws, req) => {
     clearAllTimers();
     console.log("Media Stream getrennt", code, reason?.toString?.());
   });
-
   ws.on("error", (err) => {
     closed = true;
     clearAllTimers();
@@ -371,5 +341,5 @@ wss.on("connection", (ws, req) => {
 });
 
 // ---------- Start ----------
-const PORT = process.env.PORT || 3000; // Render setzt PORT automatisch
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Bot läuft auf Port ${PORT}`));
