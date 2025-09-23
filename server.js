@@ -1,5 +1,5 @@
 // server.js
-// Twilio Voice Webhook + Media Streams + WAV + OpenAI Whisper + Antwort sagen
+// Twilio Voice Webhook + Media Streams + WAV + OpenAI Whisper + Turn-Taking
 
 const express = require("express");
 const twilio = require("twilio");
@@ -14,13 +14,23 @@ const app = express();
 
 // ---- ENV & Clients ----
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+
+// Twilio-Client lazy initialisieren (damit Start nicht crasht, wenn ENV fehlt)
+let twilioClient = null;
+function getTwilioClient() {
+  if (twilioClient) return twilioClient;
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) {
+    console.warn("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN nicht gesetzt – Antworten per Say sind deaktiviert.");
+    return null;
+  }
+  twilioClient = twilio(sid, token);
+  return twilioClient;
+}
 
 // ---- Middleware ----
-app.use(express.urlencoded({ extended: false })); // Twilio form POST
+app.use(express.urlencoded({ extended: false })); // Twilio form POSTs
 app.use(express.json()); // für Status-Callbacks / JSON
 
 // Begrüßung per Env steuerbar
@@ -39,8 +49,8 @@ function buildTwiml() {
   connect.stream({
     // >>> Falls deine Render-URL anders ist: HIER anpassen
     url: "wss://croque-bot.onrender.com/media",
-    track: "inbound_track", // wichtig: nicht "inbound"
-    // absolute URL!
+    track: "inbound_track",
+    // absolute URL:
     statusCallback: "https://croque-bot.onrender.com/ms-status",
     statusCallbackMethod: "POST",
   });
@@ -106,8 +116,21 @@ function decodeMuLawBuffer(buf) {
 
 const SAMPLE_RATE = 8000; // Twilio Media Streams = 8kHz µ-law
 
-// ---- Während des Calls etwas sagen + Stream wieder starten ----
+// einfache XML-Escapes
+function escapeXml(s = "") {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Während des Calls etwas sagen + Stream wieder starten
 async function sayToCaller(callSid, text) {
+  const client = getTwilioClient();
+  if (!client) {
+    console.warn("Kein Twilio-Client -> überspringe sayToCaller()");
+    return;
+  }
   const replyTwiml =
     `<?xml version="1.0" encoding="UTF-8"?>
      <Response>
@@ -119,18 +142,10 @@ async function sayToCaller(callSid, text) {
                  statusCallbackMethod="POST"/>
        </Connect>
      </Response>`;
-  await twilioClient.calls(callSid).update({ twiml: replyTwiml });
+  await client.calls(callSid).update({ twiml: replyTwiml });
 }
 
-// einfache XML-Escapes
-function escapeXml(s = "") {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// ---- WAV schreiben ----
+// WAV-Datei aus PCM16 LE @ 8kHz erzeugen
 function writeWav(filepath, pcmBuffer, sampleRate) {
   return new Promise((resolve, reject) => {
     try {
@@ -149,7 +164,7 @@ function writeWav(filepath, pcmBuffer, sampleRate) {
   });
 }
 
-// ---- Whisper (OpenAI) – Transkription am Call-Ende ----
+// OpenAI Whisper – Transkription einer WAV
 async function transcribeWithOpenAI(wavPath) {
   if (!process.env.OPENAI_API_KEY) {
     console.warn("Kein OPENAI_API_KEY gesetzt – überspringe Transkription.");
@@ -171,9 +186,9 @@ async function transcribeWithOpenAI(wavPath) {
   }
 }
 
-// --- Turn-Taking mit einfacher Sprechpausenerkennung (VAD-light) ---
-const SILENCE_MS = 1200;           // Pause-Länge, die ein „Turn-Ende“ signalisiert
-const MIN_AUDIO_MS = 1200;         // Mindestens ~1,2s Audio sammeln, bevor wir transkribieren
+// ---- Turn-Taking mit einfacher Sprechpausenerkennung (VAD-light) ----
+const SILENCE_MS = 800;   // Pause-Länge, die ein „Turn-Ende“ signalisiert
+const MIN_AUDIO_MS = 800; // Mindestens ~0,8s Audio sammeln
 
 wss.on("connection", (ws, req) => {
   console.log("WS connection attempt:", req.url, "headers:", req.headers);
@@ -187,8 +202,8 @@ wss.on("connection", (ws, req) => {
   let firstPacketAt = 0;
   let lastPacketAt = 0;
   let silenceTimer = null;
-  let processing = false;   // schützt vor paralleler Transkription
-  let closed = false;       // WS geschlossen?
+  let processing = false; // schützt vor paralleler Transkription
+  let closed = false;
 
   function clearSilenceTimer() {
     if (silenceTimer) {
@@ -203,16 +218,28 @@ wss.on("connection", (ws, req) => {
   }
 
   async function onSilenceTimeout() {
-    // Nur auslösen, wenn wir genug Audio haben und nicht bereits transkribieren
     if (processing || closed) return;
-    const durationMs = lastPacketAt && firstPacketAt ? (lastPacketAt - firstPacketAt) : 0;
-    if (durationMs < MIN_AUDIO_MS || pcmChunks.length === 0) {
-      // Zu kurz – weiter zuhören
-      return;
-    }
+    const durationMs = (lastPacketAt && firstPacketAt) ? (lastPacketAt - firstPacketAt) : 0;
+    if (durationMs < MIN_AUDIO_MS || pcmChunks.length === 0) return;
 
     processing = true;
     try {
+      // 1) Sofortige Bestätigung sagen, damit der Call aktiv bleibt
+      if (currentCallSid) {
+        try {
+          await sayToCaller(currentCallSid, "Einen Moment, ich verarbeite das.");
+          // Dieses calls.update beendet den aktuellen Stream
+          // und startet direkt danach einen neuen <Stream>.
+        } catch (err) {
+          if (err?.code === 21220) {
+            console.warn("Call nicht mehr aktiv (21220) – Bestätigungsansage übersprungen.");
+          } else {
+            console.error("Fehler bei Bestätigungsansage:", err);
+          }
+        }
+      }
+
+      // 2) Jetzt in Ruhe WAV schreiben + transkribieren
       const wavPath = path.join("/tmp", `turn_${Date.now()}.wav`);
       await writeWav(wavPath, Buffer.concat(pcmChunks), SAMPLE_RATE);
       console.log("TURN WAV geschrieben:", wavPath, `(${Math.round(durationMs)}ms)`);
@@ -220,24 +247,23 @@ wss.on("connection", (ws, req) => {
       const transcript = await transcribeWithOpenAI(wavPath);
       console.log("TURN Transkript:", transcript);
 
-      // Antwort nur versuchen, wenn wir eine CallSid haben
+      // 3) Optionale inhaltliche Antwort (zweite Ansage)
       if (currentCallSid && transcript) {
-        const reply = `Ich habe verstanden: ${transcript}. Was möchten Sie genau bestellen?`;
         try {
+          const reply = `Ich habe verstanden: ${transcript}. Was möchten Sie genau bestellen?`;
           await sayToCaller(currentCallSid, reply);
         } catch (err) {
-          // Wenn der Call schon beendet ist (21220), nicht schlimm – nur loggen
           if (err?.code === 21220) {
-            console.warn("Call nicht mehr aktiv (21220) – Antwort übersprungen.");
+            console.warn("Call nicht mehr aktiv (21220) – inhaltliche Antwort übersprungen.");
           } else {
-            console.error("Fehler bei sayToCaller:", err);
+            console.error("Fehler bei inhaltlicher Antwort:", err);
           }
         }
       }
     } catch (e) {
       console.error("Fehler im Turn-Handling:", e);
     } finally {
-      // Buffer für nächsten Turn zurücksetzen & weiter zuhören
+      // Buffer für nächsten Turn zurücksetzen
       pcmChunks = [];
       firstPacketAt = 0;
       lastPacketAt = 0;
@@ -262,7 +288,6 @@ wss.on("connection", (ws, req) => {
       case "start":
         currentCallSid = data.start?.callSid || "unknown";
         console.log("Stream start:", currentCallSid, data.start?.streamSid);
-        // Ab hier hört der Bot zu
         break;
 
       case "media":
@@ -285,9 +310,9 @@ wss.on("connection", (ws, req) => {
         console.log("Stream stop. Total media packets:", mediaCount);
         clearSilenceTimer();
 
-        // Optional: Wenn noch Audio im Buffer liegt, versuche letzte Runde zu verarbeiten
+        // Letzten Rest (falls noch was im Buffer) versuchen
         if (!processing && pcmChunks.length > 0) {
-          await onSilenceTimeout(); // kann fail-safen – falls Call schon beendet ist, fangen wir es ab
+          await onSilenceTimeout();
         }
         break;
 
@@ -308,7 +333,6 @@ wss.on("connection", (ws, req) => {
     console.error("WS error:", err);
   });
 });
-
 
 // ---- Start ----
 const PORT = process.env.PORT || 3000; // Render setzt PORT automatisch
